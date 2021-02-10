@@ -26,8 +26,9 @@ import com.microsoft.hyperspace.{ActiveSparkSession, Hyperspace}
 import com.microsoft.hyperspace.actions.Constants
 import com.microsoft.hyperspace.index.IndexLogEntry
 import com.microsoft.hyperspace.index.rankers.FilterIndexRanker
+import com.microsoft.hyperspace.index.sources.SourceRelation
 import com.microsoft.hyperspace.telemetry.{AppInfo, HyperspaceEventLogging, HyperspaceIndexUsageEvent}
-import com.microsoft.hyperspace.util.{HyperspaceConf, LogicalPlanUtils, ResolverUtils}
+import com.microsoft.hyperspace.util.{HyperspaceConf, ResolverUtils}
 
 /**
  * FilterIndex rule looks for opportunities in a logical plan to replace
@@ -99,7 +100,7 @@ object FilterIndexRule
       filter: Filter,
       outputColumns: Seq[String],
       filterColumns: Seq[String]): Seq[IndexLogEntry] = {
-    RuleUtils.getLogicalRelation(filter) match {
+    RuleUtils.getSourceRelation(spark, filter) match {
       case Some(r) =>
         val indexManager = Hyperspace
           .getContext(spark)
@@ -121,7 +122,7 @@ object FilterIndexRule
         // Get candidate via file-level metadata validation. This is performed after pruning
         // by column schema, as this might be expensive when there are numerous files in the
         // relation or many indexes to be checked.
-        RuleUtils.getCandidateIndexes(spark, candidateIndexes, r)
+        RuleUtils.getCandidateIndexes(spark, candidateIndexes, r.plan)
 
       case None => Nil // There is zero or more than one LogicalRelation nodes in Filter's subplan
     }
@@ -161,13 +162,8 @@ object ExtractFilterNode {
       Seq[String]) // filter columns
 
   def unapply(plan: LogicalPlan): Option[returnType] = plan match {
-    case project @ Project(
-          _,
-          filter @ Filter(
-            condition: Expression,
-            p: LogicalPlan))
-        if LogicalPlanUtils.isSupportedRelation(p) &&
-            !RuleUtils.isIndexApplied(p) =>
+    case project @ Project(_, filter @ Filter(condition: Expression, ExtractRelation(relation)))
+        if !RuleUtils.isIndexApplied(relation) =>
       val projectColumnNames = CleanupAliases(project)
         .asInstanceOf[Project]
         .projectList
@@ -177,16 +173,24 @@ object ExtractFilterNode {
 
       Some(project, filter, projectColumnNames, filterColumnNames)
 
-    case filter @ Filter(
-          condition: Expression,
-          p: LogicalPlan)
-        if LogicalPlanUtils.isSupportedRelation(p) &&
-            !RuleUtils.isIndexApplied(p) =>
-      val relationColumnsName = p.output.map(_.name)
+    case filter @ Filter(condition: Expression, ExtractRelation(relation))
+        if !RuleUtils.isIndexApplied(relation) =>
+      val relationColumnsName = relation.plan.output.map(_.name)
       val filterColumnNames = condition.references.map(_.name).toSeq
 
       Some(filter, filter, relationColumnsName, filterColumnNames)
 
     case _ => None // plan does not match with any of filter index rule patterns
+  }
+}
+
+object ExtractRelation extends ActiveSparkSession {
+  def unapply(plan: LogicalPlan): Option[SourceRelation] = {
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
+    if (provider.isSupportedRelation(plan)) {
+      Some(provider.getSourceRelation(plan))
+    } else {
+      None
+    }
   }
 }

@@ -92,30 +92,6 @@ class FileBasedSourceProviderManager(spark: SparkSession) {
   }
 
   /**
-   * Runs allFiles() for each provider.
-   *
-   * @param logicalPlan Logical plan to retrieve all input files.
-   * @return List of all input files.
-   * @throws HyperspaceException if multiple providers returns [[Some]] or
-   *                             if no providers return [[Some]].
-   */
-  def allFiles(logicalPlan: LogicalPlan): Seq[FileStatus] = {
-    run(p => p.allFiles(logicalPlan))
-  }
-
-  /**
-   * Runs partitionBasePath() for each provider.
-   *
-   * @param logicalPlan Partitioned location.
-   * @return basePath string to read the given partitioned location.
-   * @throws HyperspaceException if multiple providers returns [[Some]] or
-   *                             if no providers return [[Some]].
-   */
-  def partitionBasePath(logicalPlan: LogicalPlan): Option[String] = {
-    run(p => p.partitionBasePath(logicalPlan))
-  }
-
-  /**
    * Runs lineagePairs() for each provider.
    *
    * @param logicalPlan Logical plan to check the relation type.
@@ -138,6 +114,28 @@ class FileBasedSourceProviderManager(spark: SparkSession) {
    */
   def hasParquetAsSourceFormat(logicalPlan: LogicalPlan): Boolean = {
     run(p => p.hasParquetAsSourceFormat(logicalPlan))
+  }
+
+  /**
+   * Returns true if the given logical plan is a supported relation.
+   *
+   * @param plan A Logical plan to check if it's supported.
+   * @return true if supported.
+   */
+  def isSupportedRelation(plan: LogicalPlan): Boolean = {
+    run(p => p.isSupportedRelation(plan))
+  }
+
+  /**
+   * Returns the [[SourceRelation]] that wraps the given logical plan.
+   * If you are using this from an extractor, check if the logical plan
+   * is supported first by using [[isSupportedRelation]].
+   *
+   * @param logicalPlan Logical plan to convert to [[SourceRelation]]
+   * @return [[SourceRelation]] that wraps the given logical plan.
+   */
+  def getSourceRelation(logicalPlan: LogicalPlan): SourceRelation = {
+    run(p => p.getSourceRelation(logicalPlan))
   }
 
   /**

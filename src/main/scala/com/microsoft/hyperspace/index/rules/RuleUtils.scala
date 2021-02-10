@@ -33,6 +33,7 @@ import com.microsoft.hyperspace.Hyperspace
 import com.microsoft.hyperspace.index._
 import com.microsoft.hyperspace.index.IndexLogEntryTags.{HYBRIDSCAN_RELATED_CONFIGS, IS_HYBRIDSCAN_CANDIDATE}
 import com.microsoft.hyperspace.index.plans.logical.{BucketUnion, IndexHadoopFsRelation}
+import com.microsoft.hyperspace.index.sources.SourceRelation
 import com.microsoft.hyperspace.util.{HyperspaceConf, LogicalPlanUtils}
 
 object RuleUtils {
@@ -184,17 +185,8 @@ object RuleUtils {
    * @param logicalPlan Logical plan to check if an index is applied.
    * @return true if the relation has index plan identifier. Otherwise false.
    */
-  def isIndexApplied(logicalPlan: LogicalPlan): Boolean = {
-    logicalPlan match {
-      case lr: LogicalRelation =>
-        lr.relation match {
-          case hdfsRelation: HadoopFsRelation =>
-            hdfsRelation.options.exists(_.equals(IndexConstants.INDEX_RELATION_IDENTIFIER))
-          case _ => false
-        }
-      case v2: DataSourceV2Relation =>
-        v2.options.exists(_.equals(IndexConstants.INDEX_RELATION_IDENTIFIER))
-    }
+  def isIndexApplied(relation: SourceRelation): Boolean = {
+    relation.options.exists(_.equals(IndexConstants.INDEX_RELATION_IDENTIFIER))
   }
 
   /**
@@ -222,14 +214,14 @@ object RuleUtils {
       useBucketSpec: Boolean,
       useBucketUnionForAppended: Boolean): LogicalPlan = {
     // Check pre-requisite.
-    val logicalRelation = getLogicalRelation(plan)
-    assert(logicalRelation.isDefined)
+    val sourceRelation = getSourceRelation(spark, plan)
+    assert(sourceRelation.isDefined)
 
     // If there is no change in source data files, the index can be applied by
     // transformPlanToUseIndexOnlyScan regardless of Hybrid Scan config.
     // This tag should always exist if Hybrid Scan is enabled.
     val hybridScanRequired = HyperspaceConf.hybridScanEnabled(spark) &&
-      index.getTagValue(logicalRelation.get, IndexLogEntryTags.HYBRIDSCAN_REQUIRED).get
+      index.getTagValue(sourceRelation.get.plan, IndexLogEntryTags.HYBRIDSCAN_REQUIRED).get
 
     // If the index has appended files and/or deleted files, which means the current index data
     // is outdated, Hybrid Scan should be used to handle the newly updated source files.
@@ -251,15 +243,13 @@ object RuleUtils {
    * @param logicalPlan given logical plan to extract LogicalRelation from.
    * @return if the plan is linear, the LogicalRelation node; Otherwise None.
    */
-  def getLogicalRelation(logicalPlan: LogicalPlan): Option[LogicalPlan] = {
-    val lrs = logicalPlan.collect {
-      case r: LogicalRelation => r
-      case v2: DataSourceV2Relation => v2
-    }
-    if (lrs.length == 1) {
-      Some(lrs.head)
+  def getSourceRelation(spark: SparkSession, plan: LogicalPlan): Option[SourceRelation] = {
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
+    val leaves = plan.collectLeaves()
+    if (leaves.size == 1 && provider.isSupportedRelation(leaves.head)) {
+      Some(provider.getSourceRelation(leaves.head))
     } else {
-      None // logicalPlan is non-linear or it has no LogicalRelation.
+      None
     }
   }
 
@@ -301,17 +291,15 @@ object RuleUtils {
     //        Project(A,B) -> Filter(C = 10) -> Scan (A,B,C,D,E)
     // in the presence of a suitable index, the getIndexPlan() method will emit:
     //        Project(A,B) -> Filter(C = 10) -> Index Scan (A,B,C)
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
     plan transformDown {
-      case baseRelation @ LogicalRelation(_: HadoopFsRelation, baseOutput, _, _) =>
-        val relation = makeHadoopFsRelation(index, baseRelation.schema)
+      case leaf: LeafNode if provider.isSupportedRelation(leaf) =>
+        val relation = provider.getSourceRelation(leaf)
+        val hadoopRelation = makeHadoopFsRelation(index, relation.plan.schema)
         val updatedOutput =
-          baseOutput.filter(attr => relation.schema.fieldNames.contains(attr.name))
-        baseRelation.copy(relation = relation, output = updatedOutput)
-      case v2Relation @ DataSourceV2Relation(_, output, _, _, _) =>
-        val relation = makeHadoopFsRelation(index, v2Relation.schema)
-        val updatedOutput =
-          output.filter(attr => relation.schema.fieldNames.contains(attr.name))
-        new LogicalRelation(relation, updatedOutput, None, false)
+          relation.plan.output.filter(attr =>
+            hadoopRelation.schema.fieldNames.contains(attr.name))
+        relation.toLogicalRelation(hadoopRelation, updatedOutput)
     }
   }
 
@@ -337,7 +325,7 @@ object RuleUtils {
       useBucketUnionForAppended: Boolean): LogicalPlan = {
     var unhandledAppendedFiles: Seq[Path] = Nil
 
-    def getAppendedAndDeletedFiles(plan: LogicalPlan): (Set[FileInfo], Seq[Path]) = {
+    def getAppendedAndDeletedFiles(relation: SourceRelation): (Set[FileInfo], Seq[Path]) = {
       if (!HyperspaceConf.hybridScanEnabled(spark) && index.hasSourceUpdate) {
         // If the index contains the source update info, it means the index was validated
         // with the latest signature including appended files and deleted files, but
@@ -345,11 +333,8 @@ object RuleUtils {
         // appendedFiles and deletedFiles in IndexLogEntry.
         (index.deletedFiles, index.appendedFiles.map(f => new Path(f.name)).toSeq)
       } else {
-        val curFiles = Hyperspace
-          .getContext(spark)
-          .sourceProviderManager
-          .allFiles(plan)
-          .map(f => FileInfo(f, index.fileIdTracker.addFile(f), asFullPath = true))
+        val curFiles = relation.allFiles.map(f =>
+          FileInfo(f, index.fileIdTracker.addFile(f), asFullPath = true))
         if (HyperspaceConf.hybridScanDeleteEnabled(spark) && index.hasLineageColumn) {
           val (exist, nonExist) = curFiles.partition(index.sourceFileInfoSet.contains)
           val filesAppended = nonExist.map(f => new Path(f.name))
@@ -362,13 +347,16 @@ object RuleUtils {
           // Append-only implementation of getting appended files for efficiency.
           // It is guaranteed that there is no deleted files via the condition
           // 'deletedCnt == 0 && commonCnt > 0' in isHybridScanCandidate function.
-          (Set.empty, curFiles.filterNot(index.sourceFileInfoSet.contains).map(f =>
-            new Path(f.name)))
+          (
+            Set.empty,
+            curFiles.filterNot(index.sourceFileInfoSet.contains).map(f => new Path(f.name)))
         }
       }
     }
 
-    def getFilesToReadAndUnhandled(filesDeleted: Set[FileInfo], filesAppended: Seq[Path],
+    def getFilesToReadAndUnhandled(
+        filesDeleted: Set[FileInfo],
+        filesAppended: Seq[Path],
         partitionSchema: StructType): (Seq[Path], Seq[Path]) = {
       if (useBucketSpec || !index.hasParquetAsSourceFormat || filesDeleted.nonEmpty ||
           partitionSchema.nonEmpty) {
@@ -391,7 +379,9 @@ object RuleUtils {
       }
     }
 
-    def getIndexHadoopFsRelation(plan: LogicalPlan, filesToRead: Seq[Path],
+    def getIndexHadoopFsRelation(
+        plan: LogicalPlan,
+        filesToRead: Seq[Path],
         filesForDelete: Set[FileInfo],
         wrapLocation: (Seq[Path], InMemoryFileIndex) => InMemoryFileIndex) = {
       // In order to handle deleted files, read index data with the lineage column so that
@@ -414,9 +404,11 @@ object RuleUtils {
         Map(IndexConstants.INDEX_RELATION_IDENTIFIER))(spark, index)
     }
 
-    def injectFilterNotForDeletedFiles(files: Set[FileInfo], fsRelation: HadoopFsRelation,
-        output: Seq[AttributeReference],
-        createRelationFn: (HadoopFsRelation, Seq[AttributeReference]) => LogicalRelation) = {
+    def injectFilterNotForDeletedFiles(
+        files: Set[FileInfo],
+        fsRelation: HadoopFsRelation,
+        output: Seq[Attribute],
+        createRelationFn: (HadoopFsRelation, Seq[Attribute]) => LogicalRelation) = {
       val updatedOutput =
         output.filter(attr => fsRelation.schema.fieldNames.contains(attr.name))
       if (files.isEmpty) {
@@ -438,35 +430,26 @@ object RuleUtils {
       }
     }
 
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
     // Get transformed plan with index data and appended files if applicable.
     val indexPlan = plan transformUp {
       // Use transformUp here as currently one Logical Relation is allowed (pre-requisite).
       // The transformed plan will have LogicalRelation as a child; for example, LogicalRelation
       // can be transformed to 'Project -> Filter -> Logical Relation'. Thus, with transformDown,
       // it will be matched again and transformed recursively which causes stack overflow exception.
-      case baseRelation @ LogicalRelation(
-            _ @HadoopFsRelation(location: FileIndex, _, _, _, _, _),
-            baseOutput,
-            _,
-            _) =>
-        val (filesDeleted, filesAppended) = getAppendedAndDeletedFiles(baseRelation)
+      case leaf: LeafNode if provider.isSupportedRelation(leaf) =>
+        val relation = provider.getSourceRelation(leaf)
+        val (filesDeleted, filesAppended) = getAppendedAndDeletedFiles(relation)
         val (filesToRead, unhandledFiles) =
-          getFilesToReadAndUnhandled(filesDeleted, filesAppended, location.partitionSchema)
+          getFilesToReadAndUnhandled(filesDeleted, filesAppended, relation.partitionSchema)
         unhandledAppendedFiles = unhandledFiles
-        val relation = getIndexHadoopFsRelation(baseRelation, filesToRead, filesDeleted, wrapIndex)
-
-        injectFilterNotForDeletedFiles(filesDeleted, relation, baseOutput,
-          (r, attrs) => baseRelation.copy(relation = r, output = attrs))
-
-      case v2Relation @ DataSourceV2Relation(_, baseOutput, _, _, userSchema) =>
-        val (filesDeleted, filesAppended) = getAppendedAndDeletedFiles(v2Relation)
-        val (filesToRead, unhandledFiles) = getFilesToReadAndUnhandled(filesDeleted, filesAppended,
-          userSchema.getOrElse(StructType(Nil)))
-        unhandledAppendedFiles = unhandledFiles
-        val relation = getIndexHadoopFsRelation(v2Relation, filesToRead, filesDeleted, wrapIndex)
-
-        injectFilterNotForDeletedFiles(filesDeleted, relation, baseOutput,
-          (r, attrs) => new LogicalRelation(r, attrs, None, false))
+        val fsRelation =
+          getIndexHadoopFsRelation(relation.plan, filesToRead, filesDeleted, wrapIndex)
+        injectFilterNotForDeletedFiles(
+          filesDeleted,
+          fsRelation,
+          relation.plan.output,
+          (r, attrs) => relation.toLogicalRelation(r, attrs))
     }
 
     if (unhandledAppendedFiles.nonEmpty) {
@@ -520,29 +503,24 @@ object RuleUtils {
       index: IndexLogEntry,
       originalPlan: LogicalPlan,
       filesAppended: Seq[Path]): LogicalPlan = {
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
 
-    def getFileIndexLocation(plan: LogicalPlan, files: Seq[Path],
-        wrapLocation: InMemoryFileIndex => InMemoryFileIndex) = {
+    def getFileIndexLocation(
+        plan: LogicalPlan,
+        files: Seq[Path],
+        wrapLocation: InMemoryFileIndex => InMemoryFileIndex): InMemoryFileIndex = {
       // Set "basePath" so that partitioned columns are also included in the output schema.
       val opts = plan match {
-        case _ @ LogicalRelation(
-              _ @ HadoopFsRelation(location: FileIndex, _, _, _, _, _), _, _, _) =>
-          if (location.partitionSchema.isEmpty) {
-            None
-          } else {
-            Some(Hyperspace.getContext(spark).sourceProviderManager.partitionBasePath(plan))
-          }
-        case _: DataSourceV2Relation =>
-          Some(Hyperspace.getContext(spark).sourceProviderManager.partitionBasePath(plan))
+        case p if provider.isSupportedRelation(p) =>
+          provider.getSourceRelation(p).partitionBasePath
       }
-      val options = opts.flatMap(basePath =>
-        basePath.map(o => Map("basePath" -> o))).getOrElse(Map())
+      val options = opts.map(basePath => Map("basePath" -> basePath)).getOrElse(Map())
       wrapLocation(new InMemoryFileIndex(spark, files, options, None))
     }
 
     val wrapIndex = (fi: InMemoryFileIndex) => {
-      index.withCachedTag(originalPlan,
-        IndexLogEntryTags.INMEMORYFILEINDEX_HYBRID_SCAN_APPENDED)(fi)
+      index.withCachedTag(originalPlan, IndexLogEntryTags.INMEMORYFILEINDEX_HYBRID_SCAN_APPENDED)(
+        fi)
     }
 
     // Transform the location of LogicalRelation with appended files.

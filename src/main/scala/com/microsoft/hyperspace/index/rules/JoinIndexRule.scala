@@ -108,9 +108,17 @@ object JoinIndexRule
    * @return true if supported. False if not.
    */
   private def isApplicable(l: LogicalPlan, r: LogicalPlan, condition: Expression): Boolean = {
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
+    // The given plan is eligible if it is supported and index has not been applied.
+    def isEligible(p: LogicalPlan): Boolean = {
+      val leaves = p.collectLeaves()
+      leaves.size == 1 && provider.isSupportedRelation(leaves.head) &&
+      !RuleUtils.isIndexApplied(provider.getSourceRelation(leaves.head))
+    }
+
     isJoinConditionSupported(condition) &&
-    RuleUtils.getLogicalRelation(l).isDefined && RuleUtils.getLogicalRelation(r).isDefined &&
-    isPlanLinear(l) && isPlanLinear(r) && !isPlanModified(l) && !isPlanModified(r) &&
+    isEligible(l) && isEligible(r) &&
+    isPlanLinear(l) && isPlanLinear(r) &&
     ensureAttributeRequirements(l, r, condition)
   }
 
@@ -158,21 +166,6 @@ object JoinIndexRule
    */
   private def isPlanLinear(plan: LogicalPlan): Boolean =
     plan.children.length <= 1 && plan.children.forall(isPlanLinear)
-
-  /**
-   * Check if the candidate plan is already modified by Hyperspace or not.
-   * This can be determined by an identifier in options field of HadoopFsRelation.
-   *
-   * @param plan Logical plan.
-   * @return true if the relation in the plan is modified by Hyperspace.
-   */
-  private def isPlanModified(plan: LogicalPlan): Boolean = {
-    plan.find {
-      case p: LogicalRelation =>
-        RuleUtils.isIndexApplied(p)
-      case _ => false
-    }.isDefined
-  }
 
   /**
    * Requirements to support join optimizations using join indexes are as follows:
@@ -321,28 +314,28 @@ object JoinIndexRule
     val lUsable = getUsableIndexes(allIndexes, lRequiredIndexedCols, lRequiredAllCols)
     val rUsable = getUsableIndexes(allIndexes, rRequiredIndexedCols, rRequiredAllCols)
 
-    val leftRel = RuleUtils.getLogicalRelation(left).get
-    val rightRel = RuleUtils.getLogicalRelation(right).get
+    val leftRel = RuleUtils.getSourceRelation(spark, left).get
+    val rightRel = RuleUtils.getSourceRelation(spark, right).get
 
     // Get candidate via file-level metadata validation. This is performed after pruning
     // by column schema, as this might be expensive when there are numerous files in the
     // relation or many indexes to be checked.
-    val lIndexes = RuleUtils.getCandidateIndexes(spark, lUsable, leftRel)
-    val rIndexes = RuleUtils.getCandidateIndexes(spark, rUsable, rightRel)
+    val lIndexes = RuleUtils.getCandidateIndexes(spark, lUsable, leftRel.plan)
+    val rIndexes = RuleUtils.getCandidateIndexes(spark, rUsable, rightRel.plan)
 
     val compatibleIndexPairs = getCompatibleIndexPairs(lIndexes, rIndexes, lRMap)
 
     compatibleIndexPairs.map(
       indexPairs =>
         JoinIndexRanker
-          .rank(spark, leftRel, rightRel, indexPairs)
+          .rank(spark, leftRel.plan, rightRel.plan, indexPairs)
           .head)
   }
 
   private def relationOutputs(l: LogicalPlan): Seq[Attribute] = {
     l.collectLeaves()
-        .filter(LogicalPlanUtils.isSupportedRelation)
-        .flatMap(_.output)
+      .filter(LogicalPlanUtils.isSupportedRelation)
+      .flatMap(_.output)
   }
 
   /**
@@ -381,10 +374,15 @@ object JoinIndexRule
    *         columns in a chosen index
    */
   private def allRequiredCols(plan: LogicalPlan): Seq[String] = {
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
     val cleaned = CleanupAliases(plan)
     val allReferences = cleaned.collect {
-      case _ @ (_: LogicalRelation | _: DataSourceV2Relation) => Seq()
-      case p => p.references
+      case p =>
+        if (provider.isSupportedRelation(plan)) {
+          Seq()
+        } else {
+          p.references
+        }
     }.flatten
     val topLevelOutputs = cleaned.outputSet.toSeq
 

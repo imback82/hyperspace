@@ -18,7 +18,10 @@ package com.microsoft.hyperspace.index.sources
 
 import org.apache.hadoop.fs.FileStatus
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.types.StructType
 
 import com.microsoft.hyperspace.index.{FileIdTracker, Relation}
 
@@ -72,9 +75,7 @@ trait FileBasedSourceProvider extends SourceProvider {
    * @return [[Relation]] object if the given 'logicalRelation' can be processed by this provider.
    *         Otherwise, None.
    */
-  def createRelation(
-      logicalPlan: LogicalPlan,
-      fileIdTracker: FileIdTracker): Option[Relation]
+  def createRelation(logicalPlan: LogicalPlan, fileIdTracker: FileIdTracker): Option[Relation]
 
   /**
    * Given a [[Relation]], returns a new [[Relation]] that will have the latest source.
@@ -112,27 +113,6 @@ trait FileBasedSourceProvider extends SourceProvider {
   def signature(logicalPlan: LogicalPlan): Option[String]
 
   /**
-   * Retrieves all input files from the given [[LogicalPlan]].
-   *
-   * @param logicalPlan Logical plan to retrieve input files from.
-   * @return List of [[FileStatus]] for the given relation.
-   */
-  def allFiles(logicalPlan: LogicalPlan): Option[Seq[FileStatus]]
-
-  /**
-   * Constructs the basePath for the given [[LogicalPlan]].
-   *
-   * @param logicalPlan Logical plan to extract the base path from.
-   * @return basePath to read the given partitioned location.
-   *         Some(Some(path)) => The location of the given plan is supported
-   *                             and partition is specified.
-   *         Some(None) => The location of the given plan is supported
-   *                       but is un-partitioned.
-   *         None => The location of the given plan is not supported.
-   */
-  def partitionBasePath(logicalPlan: LogicalPlan): Option[Option[String]]
-
-  /**
    * Returns list of pairs of (file path, file id) to build lineage column.
    *
    * File paths should be the same format with "input_file_name()" of the given relation type.
@@ -153,4 +133,55 @@ trait FileBasedSourceProvider extends SourceProvider {
    */
   def hasParquetAsSourceFormat(logicalPlan: LogicalPlan): Option[Boolean]
 
+  /**
+   * Returns true if the given logical plan is a supported relation.
+   *
+   * @param plan A Logical plan to check if it's supported.
+   * @return true if supported.
+   */
+  def isSupportedRelation(plan: LogicalPlan): Option[Boolean]
+
+  /**
+   * Returns the [[SourceRelation]] that wraps the given logical plan.
+   * If you are using this from an extractor, check if the logical plan
+   * is supported first by using [[isSupportedRelation]].
+   *
+   * @param logicalPlan Logical plan to convert to [[SourceRelation]]
+   * @return [[SourceRelation]] that wraps the given logical plan.
+   */
+  def getSourceRelation(logicalPlan: LogicalPlan): Option[SourceRelation]
+}
+
+trait SourceRelation {
+  /**
+   * Th logical plan that this SourceRelation wraps.
+   */
+  def plan: LogicalPlan
+
+  /**
+   * Options of the current relation.
+   */
+  def options: Map[String, String]
+
+  /**
+   * All the files that the current relation references to.
+   */
+  def allFiles: Seq[FileStatus]
+
+  /**
+   * The partition schema of the current relation.
+   */
+  def partitionSchema: StructType
+
+  /**
+   * The optional partition base path of the current relation.
+   */
+  def partitionBasePath: Option[String]
+
+  /**
+   * Convert the current relation to [[LogicalRelation]].
+   */
+  def toLogicalRelation(
+      hadoopFsRelation: HadoopFsRelation,
+      newOutput: Seq[Attribute]): LogicalRelation
 }
